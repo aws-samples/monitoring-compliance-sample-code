@@ -1,0 +1,663 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Ops Compliance check 
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "General Configurations"
+        Parameters:
+          - Whitelistedresources
+          - SNSLocalTopic
+          - AutomaticRemediation
+          - ServiceTobeMonitored
+      -
+        Label:
+          default: "Alarm1 Configurations"
+        Parameters:
+          - Alarm1MetricName
+          - Alarm1Threshold
+          - Alarm1Statistics
+      -
+        Label:
+          default: "Alarm2 Configurations"
+        Parameters:
+          - Alarm2MetricName
+          - Alarm2Threshold
+          - Alarm2Statistics
+      -
+        Label:
+          default: "Alarm3 Configurations"
+        Parameters:
+          - Alarm3MetricName
+          - Alarm3Threshold
+          - Alarm3Statistics          
+
+    ParameterLabels: 
+      Whitelistedresources: 
+        default: "What are the resources that should be whitelisted for this compliance?"
+      SNSLocalTopic: 
+        default: "What is the SNS topic that will be target for CloudWatch Alarms?"
+      AutomaticRemediation: 
+        default: "Will this compliance have automated remediation?"
+      ServiceTobeMonitored: 
+        default: "What is the service that will be evaluated for compliance monitoring?"
+      Alarm1MetricName: 
+        default: "What is the metric name that will be part of this alarm? -- It is mandatory to have at least the first alarm --"
+      Alarm1Threshold: 
+        default: "What is the threshold that will be part of this alarm?"        
+      Alarm1Statistics: 
+        default: "What is the statistic that will be part of this alarm?"        
+      Alarm2MetricName: 
+        default: "What is the metric name that will be part of this alarm? -- Leave it in blank if you don't need a second alarm -- "
+      Alarm2Threshold: 
+        default: "What is the threshold that will be part of this alarm? "        
+      Alarm2Statistics: 
+        default: "What is the statistic that will be part of this alarm?"                
+      Alarm3MetricName: 
+        default: "What is the metric name that will be part of this alarm? -- Leave it in blank if you don't need a third alarm -- "
+      Alarm3Threshold: 
+        default: "What is the threshold that will be part of this alarm?"        
+      Alarm3Statistics: 
+        default: "What is the statistic that will be part of this alarm?"                        
+
+Parameters: 
+  Whitelistedresources:
+    Description: List of AWS Config ResourceIds that is whitelisted for this compliance rule 
+    Type: CommaDelimitedList
+    Default: ''
+  SNSLocalTopic:
+    Type: String
+    Description: Topic Name that will be used to send notifications
+    Default: BigPandaLocalTopic
+  AutomaticRemediation:
+    Type: String
+    Description: Enable Automatic Remediation? 
+    Default: yes
+    AllowedValues:
+      - yes
+      - no       
+  ServiceTobeMonitored:
+    Type: String
+    Description: NameSpace for CloudWatch Metric
+    Default: EC2
+    AllowedValues:
+      - EC2
+      - EBS
+      - Lambda
+      - S3
+      - SNS
+      - DynamoDB
+      - SQS
+      - RDS
+      - ALB
+  Alarm1MetricName:
+    Type: String
+    Description:  Alarm1 Metric Name 
+    Default: CPUUtilization
+  Alarm1Threshold:
+    Type: Number
+    Description: Alarm1 Metric Threshold 
+    Default: 80  
+  Alarm1Statistics:
+    Type: String
+    Description: Alarm1 Metric Statitstics 
+    Default: Average  
+    AllowedValues:
+      - Minimum
+      - Maximum
+      - Sum
+      - Average
+      - Count
+  Alarm2MetricName:
+    Type: String
+    Description:  Alarm2 Metric Name 
+    Default: StatusCheckFailed_System
+  Alarm2Threshold:
+    Type: Number
+    Description: Alarm2 Metric Threshold 
+    Default: 1 
+  Alarm2Statistics:
+    Type: String
+    Description: Alarm2 Metric Statitstics - Leave it blank to avoid alarm creation
+    Default: Maximum      
+    AllowedValues:
+      - Minimum
+      - Maximum
+      - Sum
+      - Average
+      - Count
+  Alarm3MetricName:
+    Type: String
+    Description:  Alarm3 Metric Name - Leave it blank to avoid alarm creation
+    Default: StatusCheckFailed_Instance
+  Alarm3Threshold:
+    Type: String
+    Description: Alarm3 Metric Threshold 
+    Default: 1
+  Alarm3Statistics:
+    Type: String
+    Description: Alarm3 Metric Statitstics 
+    Default: Maximum      
+    AllowedValues:
+      - Minimum
+      - Maximum
+      - Sum
+      - Average
+      - Count
+
+Mappings:
+  NamespaceMapping:
+    EC2:
+      ConfigService: "AWS::EC2::Instance"
+      Namespace: "AWS/EC2"
+      Dimension: "InstanceId"
+    EBS:
+      ConfigService: "AWS::EC2::Volume"
+      Namespace: "AWS/EBS"
+      Dimension: "VolumeId"
+    Lambda:
+      ConfigService: "AWS::Lambda::Function"
+      Namespace: "AWS/Lambda"
+      Dimension: "FunctionName"
+    S3:
+      ConfigService: "AWS::S3::Bucket"
+      Namespace: "AWS/S3"
+      Dimension: "BucketName"
+    SNS:
+      ConfigService: "AWS::SNS::Topic"
+      Namespace: "AWS/SNS"
+      Dimension: "TopicName"
+    DynamoDB:
+      ConfigService: "AWS::DynamoDB::Table"
+      Namespace: "AWS/DynamoDB"
+      Dimension: "TableName"
+    SQS:
+      ConfigService: "AWS::SQS::Queue"      
+      Namespace: "AWS/SQS"
+      Dimension: "QueueName"
+    RDS:
+      ConfigService: "AWS::RDS::DBInstance"          
+      Namespace: "AWS/RDS"
+      Dimension: "DBInstanceIdentifier"
+    ALB:
+      ConfigService: "AWS::ElasticLoadBalancingV2::LoadBalancer"          
+      Namespace: "AWS/ApplicationELB"
+      Dimension: "LoadBalancer"
+      
+
+Conditions: 
+  AutomaticRemediation: !Equals [ !Ref AutomaticRemediation, yes ]
+  CreateAlarm2: !Not [!Equals [!Ref Alarm2MetricName, '']]
+  CreateAlarm3: !Not [!Equals [!Ref Alarm3MetricName, '']]
+  IsEC2: !Equals [ !Ref ServiceTobeMonitored, 'EC2' ]
+
+Resources:
+
+  OpsConfigRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: !Sub "${ServiceTobeMonitored}-with-mandatory-alarms"
+      InputParameters: 
+        Alarm1Config: !Sub
+          - |
+            {"MetricName": "${Alarm1MetricName}", "MetricThreshold": ${Alarm1Threshold}, "MetricStatistics": "${Alarm1Statistics}", "MetricNamespace": "${namespace}", "MetricDimensions": "${dimension}"}
+          - namespace: !FindInMap [NamespaceMapping, !Ref ServiceTobeMonitored, Namespace] 
+            dimension: !FindInMap [NamespaceMapping, !Ref ServiceTobeMonitored, Dimension] 
+        Alarm2Config: !Sub
+          - | 
+            {"MetricName": "${Alarm2MetricName}", "MetricThreshold": ${Alarm2Threshold}, "MetricStatistics": "${Alarm2Statistics}", "MetricNamespace": "${namespace}", "MetricDimensions": "${dimension}"}
+          - namespace: !FindInMap [NamespaceMapping, !Ref ServiceTobeMonitored, Namespace] 
+            dimension: !FindInMap [NamespaceMapping, !Ref ServiceTobeMonitored, Dimension]
+            Alarm2MetricName: !If [ CreateAlarm2, !Ref Alarm2MetricName , 'null' ]
+        Alarm3Config: !Sub 
+          - | 
+            {"MetricName": "${Alarm3MetricName}", "MetricThreshold": ${Alarm3Threshold}, "MetricStatistics": "${Alarm3Statistics}", "MetricNamespace": "${namespace}", "MetricDimensions": "${dimension}"}
+          - namespace: !FindInMap [NamespaceMapping, !Ref ServiceTobeMonitored, Namespace] 
+            dimension: !FindInMap [NamespaceMapping, !Ref ServiceTobeMonitored, Dimension]
+            Alarm3MetricName: !If [ CreateAlarm3, !Ref Alarm3MetricName , 'null' ]
+        Whitelistedresources: !Ref Whitelistedresources
+      MaximumExecutionFrequency: One_Hour
+      Scope:
+        ComplianceResourceTypes:
+          - !FindInMap [ NamespaceMapping, !Ref ServiceTobeMonitored , ConfigService ]
+      Source:
+        Owner: "CUSTOM_LAMBDA"
+        SourceDetails:
+          - EventSource: "aws.config"
+            MessageType: "ConfigurationItemChangeNotification"
+        SourceIdentifier: '{{resolve:ssm:/lambda/LambdaCheckComplianceCloudWatchARN:1}}'
+
+  RemediationForConfigRule:
+    Type: 'AWS::Config::RemediationConfiguration'
+    Properties:
+      Automatic: !If [ AutomaticRemediation, true, false ]
+      ConfigRuleName: !Ref OpsConfigRule
+      MaximumAutomaticAttempts: 5
+      RetryAttemptSeconds: 60
+      TargetId: !Ref OpsAutomationDocument
+      TargetType: SSM_DOCUMENT
+      TargetVersion: '1'
+      Parameters:
+        AutomationAssumeRole:
+          StaticValue:
+            Values:
+              - !GetAtt AutoRemediationIamRole.Arn 
+        ResourceId:
+          ResourceValue:
+            Value: RESOURCE_ID
+        SNSTopicARN:
+          StaticValue:
+            Values:
+              - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${SNSLocalTopic}"              
+        ActionRecover:
+          StaticValue:
+            Values:
+              - !Sub arn:aws:automate:${AWS::Region}:ec2:recover 
+        ConfigRuleName:
+          StaticValue:
+            Values:
+              - !Ref OpsConfigRule 
+        Alarm1Config:
+          StaticValue:
+            Values: 
+              - !Sub 
+                  - |
+                    {"MetricName": "${Alarm1MetricName}", "MetricThreshold": ${Alarm1Threshold}, "MetricStatistics": "${Alarm1Statistics}", "MetricNamespace": "${namespace}", "MetricDimensions": "${dimension}"}
+                  - namespace: !FindInMap [NamespaceMapping, !Ref ServiceTobeMonitored, Namespace] 
+                    dimension: !FindInMap [NamespaceMapping, !Ref ServiceTobeMonitored, Dimension]
+        Alarm2Config:
+          StaticValue:
+            Values:
+              - !Sub
+                  - | 
+                    {"MetricName": "${Alarm2MetricName}", "MetricThreshold": ${Alarm2Threshold}, "MetricStatistics": "${Alarm2Statistics}", "MetricNamespace": "${namespace}", "MetricDimensions": "${dimension}"}
+                  - namespace: !FindInMap [NamespaceMapping, !Ref ServiceTobeMonitored, Namespace] 
+                    dimension: !FindInMap [NamespaceMapping, !Ref ServiceTobeMonitored, Dimension]
+                    Alarm2MetricName: !If [ CreateAlarm2, !Ref Alarm2MetricName , 'null' ]
+        Alarm3Config:  
+          StaticValue:
+            Values:
+              - !Sub 
+                  - | 
+                    {"MetricName": "${Alarm3MetricName}", "MetricThreshold": ${Alarm3Threshold}, "MetricStatistics": "${Alarm3Statistics}", "MetricNamespace": "${namespace}", "MetricDimensions": "${dimension}"}
+                  - namespace: !FindInMap [NamespaceMapping, !Ref ServiceTobeMonitored, Namespace] 
+                    dimension: !FindInMap [NamespaceMapping, !Ref ServiceTobeMonitored, Dimension]
+                    Alarm3MetricName: !If [ CreateAlarm3, !Ref Alarm3MetricName , 'null' ]
+        ConfigServiceName:
+          StaticValue:
+              Values: 
+                - !FindInMap [ NamespaceMapping, !Ref ServiceTobeMonitored , ConfigService ]
+                    
+  AutoRemediationIamRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ssm.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonSSMAutomationRole'
+        - !Ref AutomationPolicy
+   
+  AutomationPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties: 
+      Description: 'Customer Managed Policy for Compliance Automation'
+      Path: / 
+      PolicyDocument: 
+        Version: 2012-10-17
+        Statement:
+          - Sid: AllowAutomation 
+            Effect: Allow
+            Action: 
+              - sts:AssumeRole
+              - iam:PassRole
+              - cloudwatch:* 
+              - iam:CreateServiceLinkedRole
+              - config:* 
+            Resource:
+              - '*'
+
+  OpsAutomationDocument:
+    Type: 'AWS::SSM::Document'
+    Properties: 
+      DocumentType: Automation
+      Content:
+        schemaVersion: "0.3"
+        assumeRole: "{{ AutomationAssumeRole }}"
+        description: SSM Document
+        mainSteps:
+          - name: VerifyCloudWatchConfig
+            action: 'aws:executeScript'
+            inputs:
+              Runtime: python3.6
+              Handler: script_handler
+              Script: |-
+                import json, boto3, string
+                client_cw = boto3.client('cloudwatch')
+                client_config = boto3.client('config')
+                def get_resource_history(events):
+                  response = client_config.get_resource_config_history(
+                      resourceType=events['ConfigServiceName'],
+                      resourceId=events['ResourceId']
+                  )
+                  return response
+                def script_handler(events, context):
+                  print(events)
+                  temp_dict = {}
+                  results = {}
+                  response = get_resource_history(events)
+                  if events['ConfigServiceName'] == 'AWS::RDS::DBInstance' or events['ConfigServiceName'] == 'AWS::SNS::Topic':
+                    resourceId_cw = response['configurationItems'][0]['resourceName']
+                  elif events['ConfigServiceName'] == 'AWS::ElasticLoadBalancingV2::LoadBalancer':
+                    print('this is the response %s' % response)
+                    alb_resource_name = response['configurationItems'][0]['resourceId']
+                    resourceId_cw = alb_resource_name.split('/')[1]+'/'+alb_resource_name.split('/')[2]+'/'+alb_resource_name.split('/')[3]
+                  else:
+                    resourceId_cw = events['ResourceId']
+                  del events['ResourceId']
+                  del events['ConfigServiceName']
+                  for key in events:
+                    temp_dict = json.loads(events[key])
+                    if temp_dict['MetricName'] == 'null':
+                      del key
+                  for key in events:
+                    temp_dict = json.loads(events[key])
+                    metric = temp_dict['MetricName']
+                    namespace = temp_dict['MetricNamespace']
+                    dimension = temp_dict['MetricDimensions']
+                    alarm_name = f'{resourceId_cw}-{metric}'
+                    try:
+                        response = client_cw.describe_alarms_for_metric(
+                            MetricName=metric,
+                            Namespace=namespace,
+                            Dimensions=[
+                                {
+                                    'Name': dimension,
+                                    'Value': resourceId_cw
+                                }
+                            ]
+                        )
+                        if len(response['MetricAlarms']) == 0:
+                          results[key] = json.loads(events[key])
+                          for key in results: 
+                            results[key]['MetricThreshold'] = int(results[key]['MetricThreshold'])
+                        else:
+                          for i in response['MetricAlarms']: 
+                            if i['AlarmName'] == alarm_name:
+                              results[key] = {
+                                  'MetricName': i['MetricName'],
+                                  'MetricThreshold': int(i['Threshold']),
+                                  'MetricStatistics': i['Statistic'],
+                                  'MetricNamespace': i['Namespace'],
+                                  'MetricDimensions': i['Dimensions'][0]['Name']
+                              }
+                            else:
+                              results[key] = json.loads(events[key])
+                    except Exception as e:
+                        print('Error %s' % (e)) 
+                  results['ResourceId_CW'] = resourceId_cw
+                  return results
+              InputPayload:
+                Alarm1Config: '{{ Alarm1Config }}'
+                Alarm2Config: '{{ Alarm2Config }}'
+                Alarm3Config: '{{ Alarm3Config }}'
+                ResourceId: '{{ ResourceId }}'
+                ConfigServiceName: '{{ ConfigServiceName }}'
+            outputs:
+              - Name: ResourceId_CW
+                Selector: $.Payload.ResourceId_CW
+                Type: String
+              - Name: Alarm1ConfigMetricName
+                Selector: $.Payload.Alarm1Config.MetricName
+                Type: String
+              - Name: Alarm1ConfigMetricThreshold
+                Selector: $.Payload.Alarm1Config.MetricThreshold
+                Type: Integer
+              - Name: Alarm1ConfigMetricStatistics
+                Selector: $.Payload.Alarm1Config.MetricStatistics
+                Type: String
+              - Name: Alarm1ConfigMetricNamespace
+                Selector: $.Payload.Alarm1Config.MetricNamespace
+                Type: String
+              - Name: Alarm1ConfigMetricDimensions
+                Selector: $.Payload.Alarm1Config.MetricDimensions
+                Type: String
+              - Name: Alarm2ConfigMetricName
+                Selector: $.Payload.Alarm2Config.MetricName
+                Type: String
+              - Name: Alarm2ConfigMetricThreshold
+                Selector: $.Payload.Alarm2Config.MetricThreshold
+                Type: Integer
+              - Name: Alarm2ConfigMetricStatistics
+                Selector: $.Payload.Alarm2Config.MetricStatistics
+                Type: String
+              - Name: Alarm2ConfigMetricNamespace
+                Selector: $.Payload.Alarm2Config.MetricNamespace
+                Type: String
+              - Name: Alarm2ConfigMetricDimensions
+                Selector: $.Payload.Alarm2Config.MetricDimensions
+                Type: String
+              - Name: Alarm3ConfigMetricName
+                Selector: $.Payload.Alarm3Config.MetricName
+                Type: String
+              - Name: Alarm3ConfigMetricThreshold
+                Selector: $.Payload.Alarm3Config.MetricThreshold
+                Type: Integer
+              - Name: Alarm3ConfigMetricStatistics
+                Selector: $.Payload.Alarm3Config.MetricStatistics
+                Type: String
+              - Name: Alarm3ConfigMetricNamespace
+                Selector: $.Payload.Alarm3Config.MetricNamespace
+                Type: String
+              - Name: Alarm3ConfigMetricDimensions
+                Selector: $.Payload.Alarm3Config.MetricDimensions
+                Type: String
+          - name: Alarm1
+            action: aws:executeAwsApi
+            inputs:
+              Service: cloudwatch
+              Api: PutMetricAlarm
+              AlarmActions: 
+                - "{{ SNSTopicARN }}"
+              AlarmName: "{{ VerifyCloudWatchConfig.ResourceId_CW }}-{{ VerifyCloudWatchConfig.Alarm1ConfigMetricName }}"
+              EvaluationPeriods: 1
+              ComparisonOperator: GreaterThanOrEqualToThreshold
+              MetricName: "{{ VerifyCloudWatchConfig.Alarm1ConfigMetricName}}"
+              Period: 60
+              Namespace: "{{ VerifyCloudWatchConfig.Alarm1ConfigMetricNamespace }}"
+              Statistic: "{{ VerifyCloudWatchConfig.Alarm1ConfigMetricStatistics }}"
+              Threshold: "{{ VerifyCloudWatchConfig.Alarm1ConfigMetricThreshold }}"
+              Dimensions:
+                - Name: "{{ VerifyCloudWatchConfig.Alarm1ConfigMetricDimensions }}"
+                  Value: "{{ VerifyCloudWatchConfig.ResourceId_CW }}"
+              Tags:
+                - Key: ResourceMonitored
+                  Value: "{{ ResourceId }}"
+          - Fn::If:
+            - CreateAlarm2
+            - name: Alarm2
+              action: aws:executeAwsApi
+              inputs:
+                Service: cloudwatch
+                Api: PutMetricAlarm
+                AlarmActions: 
+                  - "{{ SNSTopicARN }}"
+                  - Fn::If:
+                    - IsEC2 
+                    - "{{ ActionRecover }}"
+                    - !Ref "AWS::NoValue"
+                AlarmName: "{{ VerifyCloudWatchConfig.ResourceId_CW }}-{{ VerifyCloudWatchConfig.Alarm2ConfigMetricName }}"
+                EvaluationPeriods: 1
+                ComparisonOperator: GreaterThanOrEqualToThreshold
+                MetricName: "{{ VerifyCloudWatchConfig.Alarm2ConfigMetricName }}"
+                Period: 60
+                Namespace: "{{ VerifyCloudWatchConfig.Alarm2ConfigMetricNamespace }}"
+                Statistic: "{{ VerifyCloudWatchConfig.Alarm2ConfigMetricStatistics }}"
+                Threshold: "{{ VerifyCloudWatchConfig.Alarm2ConfigMetricThreshold }}"
+                Dimensions:
+                  - Name: "{{ VerifyCloudWatchConfig.Alarm2ConfigMetricDimensions }}"
+                    Value: "{{ VerifyCloudWatchConfig.ResourceId_CW }}"
+                Tags:
+                  - Key: ResourceMonitored
+                    Value: "{{ ResourceId }}"  
+            - !Ref "AWS::NoValue"
+          - Fn::If:
+            - CreateAlarm3            
+            - name: Alarm3
+              action: aws:executeAwsApi
+              inputs:
+                Service: cloudwatch
+                Api: PutMetricAlarm
+                AlarmActions: 
+                  - "{{ SNSTopicARN }}"
+                AlarmName: "{{ VerifyCloudWatchConfig.ResourceId_CW }}-{{ VerifyCloudWatchConfig.Alarm3ConfigMetricName }}"
+                EvaluationPeriods: 1
+                ComparisonOperator: GreaterThanOrEqualToThreshold
+                MetricName: "{{ VerifyCloudWatchConfig.Alarm3ConfigMetricName }}"
+                Period: 60
+                Namespace: "{{ VerifyCloudWatchConfig.Alarm3ConfigMetricNamespace }}"
+                Statistic: "{{ VerifyCloudWatchConfig.Alarm3ConfigMetricStatistics }}"
+                Threshold: "{{ VerifyCloudWatchConfig.Alarm3ConfigMetricThreshold }}"
+                Dimensions:
+                  - Name: "{{ VerifyCloudWatchConfig.Alarm3ConfigMetricDimensions }}"
+                    Value: "{{ VerifyCloudWatchConfig.ResourceId_CW }}"
+                Tags:
+                  - Key: ResourceMonitored
+                    Value: "{{ ResourceId }}" 
+            - !Ref "AWS::NoValue"                                       
+          - name: Wait
+            action: aws:sleep
+            inputs:
+              Duration: PT5S
+          - name: ReEvaluate
+            action: aws:executeAwsApi
+            maxAttempts: 1500
+            inputs:
+              Service: config
+              Api: StartConfigRulesEvaluation
+              ConfigRuleNames: 
+                - "{{ ConfigRuleName }}"
+        parameters:   
+          AutomationAssumeRole:
+            type: String
+            description: Automation Assume Role Arn
+          ResourceId:
+            type: String
+            description: Resource ID
+          SNSTopicARN:  
+            type: String
+            description: Big Panda SNS Topic ARN 
+          ActionRecover:
+            type: String 
+            description: ARN for EC2 AutoRecover
+          ConfigRuleName:
+            type: String
+            description: Config Rule Name 
+          Alarm1Config:
+            type: String
+            description: Alarm1 Configurations    
+          Alarm2Config:
+            type: String
+            description: Alarm2 Configurations
+          Alarm3Config:
+            type: String
+            description: Alarm3 Configurations
+          ConfigServiceName:
+            type: String
+            description: Config Service Name        
+
+  RoleforEventRule: 
+    Type: "AWS::IAM::Role"
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              Service: 
+                - events.amazonaws.com
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref ManagedPolicyEventRole
+
+  ManagedPolicyEventRole:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: 'Customer Managed Policy for BigPanda Automation'
+      Path: / 
+      PolicyDocument: 
+        Version: 2012-10-17
+        Statement:
+          - Sid: AllowAutomation 
+            Effect: Allow
+            Action: 
+              - ssm:StartAutomationExecution
+              - iam:PassRole
+            Resource:
+              - '*'
+
+  MonitorCloudWatchChanges:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Event Rule for changes in cloudwtach Alarms
+      Targets:
+        - Arn: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${CheckCloudWatchSSMDocument}:$DEFAULT"
+          Id: target-id1
+          RoleArn: !GetAtt RoleforEventRule.Arn
+      EventPattern:
+        {
+          "detail-type": [
+            "AWS API Call via CloudTrail"
+          ],
+          "source": [
+              "aws.monitoring"
+          ],          
+          "detail": {
+            "eventSource": [
+              "monitoring.amazonaws.com"
+            ],
+            "eventName": [
+              "PutMetricAlarm",
+              "DeleteAlarms"
+            ],
+            "userAgent": [
+              { 
+                "anything-but": "ssm.amazonaws.com" 
+              }
+            ]
+          }
+        }
+
+  CheckCloudWatchSSMDocument:
+    Type: 'AWS::SSM::Document'
+    Properties: 
+      DocumentType: Automation
+      Content:
+        schemaVersion: "0.3"
+        assumeRole: "{{ AutomationAssumeRole }}"
+        description: Validate CloudWatch Alarm
+        mainSteps:
+          - name: ReEvaluate
+            action: aws:executeAwsApi
+            maxAttempts: 500
+            inputs:
+              Service: config
+              Api: StartConfigRulesEvaluation
+              ConfigRuleNames: 
+                - !Ref OpsConfigRule
+        parameters:
+          AutomationAssumeRole:
+            type: String
+            description: Automation Assume Role Arn
+            default: !GetAtt AutoRemediationIamRole.Arn            

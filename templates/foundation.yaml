@@ -1,0 +1,641 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Foundation for Monitoring Compliance
+Parameters:
+  SNSLocalTopic:
+    Type: String
+    Description: Name of the Topic that will be used as local Topic
+    Default: LocalTopic
+  AlarmNameException:
+    Type: 'String'
+    Description: White List Alarm Name
+    Default: 'AlarmX'
+  Email:
+    Type: 'String'
+    Description: Notification e-mail
+    Default: 'xxx@amazon.com'
+  DefaultNotificationTopic:
+    Type: 'String'
+    Description: Name of the Local Topic that will be used in the compliance check
+    Default: 'LocalTopic'     
+  LogsRetentionInDays:
+    Description: 'Specifies the number of days you want to retain notification forwarding log events in the Lambda log group.'
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+Resources:
+  LocalSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Ref SNSLocalTopic
+      TopicName: !Ref SNSLocalTopic
+
+  LocalSNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F18
+            reason: "Condition restricts permissions to current account."
+    Properties:
+      Topics:
+        - !Ref LocalSNSTopic
+      PolicyDocument:
+        Statement:
+          - Sid: __default_statement_ID
+            Effect: Allow
+            Principal:
+              AWS: "*"
+            Action:
+            - SNS:GetTopicAttributes
+            - SNS:SetTopicAttributes
+            - SNS:AddPermission
+            - SNS:RemovePermission
+            - SNS:DeleteTopic
+            - SNS:Subscribe
+            - SNS:ListSubscriptionsByTopic
+            - SNS:Publish
+            - SNS:Receive
+            Resource: !Ref LocalSNSTopic
+            Condition:
+              StringEquals:
+                AWS:SourceOwner: !Sub ${AWS::AccountId}
+          - Sid: TrustCWEToPublishEventsToMyTopic
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref LocalSNSTopic
+
+  SNSNotificationSubscription:
+    Type: "AWS::SNS::Subscription"
+    Properties:
+      Endpoint: !Ref Email 
+      Protocol: email
+      TopicArn: !Ref LocalSNSTopic
+
+  LambdaCheckComplianceSNSTopic:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Description: Lambda function to evaluate CloudWatch Alarms using notification to Standard SNS Topic
+      Code:
+        ZipFile: |
+          import json, boto3, os, logging
+          from botocore.exceptions import ClientError
+          logging.basicConfig(format='%(asctime)s [%(levelname)+8s]%(module)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+          logger = logging.getLogger(__name__)
+          logger.setLevel(getattr(logging, os.getenv('LOG_LEVEL', 'INFO')))
+          client_cw = boto3.client('cloudwatch')
+          client_config = boto3.client('config')
+          def cw_describe(configuration_item, default_notification_topic):
+              region = os.getenv('REGION')
+              accountid = os.getenv('ACCOUNTID')
+              default_notification_topic_arn = f'arn:aws:sns:{region}:{accountid}:{default_notification_topic}'
+              logger.info('this is the arn for local topic %s' % (default_notification_topic_arn))
+              try:
+                  response = client_cw.describe_alarms( 
+                      AlarmNames = [
+                            configuration_item['resourceName']  
+                      ]    
+                  )
+              except Exception as e:
+                  logger.error('Cannot describe cloudwatch alarm  %s' % (configuration_item['resourceName'])) 
+                  logger.error(e)
+              logger.info('this is the response from describe alarms %s' % (response))
+              for i in response['MetricAlarms']: 
+                  for alarms in i['AlarmActions']:
+                      logger.info('actions in the alarm : %s ' % (alarms))
+                      if alarms == default_notification_topic_arn:
+                          return False 
+              return True 
+          def evaluate_compliance(alarm_exception, configuration_item, default_notification_topic):
+              cloudwatch_alarm_name = configuration_item['resourceName']
+              if configuration_item['configurationItemStatus'] == "ResourceDeleted":
+                  logger.info('%s was deleted and therefore cannot be validate' % (configuration_item['resourceName']))
+                  return {
+                      "compliance_type": "NOT_APPLICABLE",
+                      "annotation": "The configurationItem was deleted and therefore cannot be validated"
+                  }
+              if configuration_item['resourceName'] == alarm_exception: 
+                  logger.info('%s is an exception, considering compliant' % (configuration_item['resourceName']))
+                  return {
+                      "compliance_type": "COMPLIANT",
+                      "annotation": "This resource is compliant with the rule."
+                  }        
+              violation = cw_describe(configuration_item, default_notification_topic)
+              if violation: 
+                  annotation = f'The CloudWatch Alarm {cloudwatch_alarm_name} doesnt have notifications to {default_notification_topic} '
+                  logger.info(annotation)
+                  return {
+                      "compliance_type": "NON_COMPLIANT",
+                      "annotation": json.dumps(annotation)
+                  }
+              else:
+                  return {
+                      "compliance_type": "COMPLIANT",
+                      "annotation": "This resource is compliant with the rule."
+                  }
+          def lambda_handler(event, context):
+              rule_parameters = json.loads(event["ruleParameters"])
+              invoking_event = json.loads(event["invokingEvent"])
+              configuration_item = invoking_event["configurationItem"]
+              result_token = event["resultToken"]
+              alarm_exception = rule_parameters['AlarmNameException']
+              default_notification_topic = rule_parameters['DefaultNotificationTopic']
+              evaluation = evaluate_compliance(alarm_exception, configuration_item, default_notification_topic)
+              try:
+                  client_config.put_evaluations(
+                  Evaluations=[
+                      {
+                          "ComplianceResourceType":
+                              configuration_item["resourceType"],
+                          "ComplianceResourceId":
+                              configuration_item["resourceId"],
+                          "ComplianceType":
+                              evaluation["compliance_type"],
+                          "Annotation":
+                              evaluation["annotation"],
+                          "OrderingTimestamp":
+                              configuration_item["configurationItemCaptureTime"]
+                      },
+                  ],
+                  ResultToken=result_token
+                  )
+              except ClientError as e:
+                  message = e.response['Error']['Message']
+                  logger.error('Error trying to put Evaluatons')
+                  logger.error(e)
+      Handler: 'index.lambda_handler'
+      MemorySize: 128
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: 'python3.7'
+      Timeout: 60
+      Environment:
+        Variables:
+          REGION: !Ref AWS::Region
+          ACCOUNTID: !Ref AWS::AccountId
+
+  LambdaManagedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: 'Customer Managed Policy for Lambda AWS Custom Rule for Ops Compliance'
+      Path: /
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: CloudWatchDescribeMetrics
+            Effect: Allow
+            Action:
+              - cloudwatch:DeleteAlarms
+              - cloudwatch:DescribeAlarms
+              - cloudwatch:DescribeAlarmsForMetric
+              - cloudwatch:ListMetrics
+              - cloudwatch:DescribeAlarmHistory
+              - cloudwatch:DescribeAlarmsForMetric
+            Resource:
+              - '*'
+          - Sid: AWSConfigPutEvaluation
+            Effect: Allow
+            Action:
+              - config:PutConfigRule
+              - config:PutEvaluations
+            Resource:
+              - '*'
+
+  LambdaRole: 
+    Type: "AWS::IAM::Role"
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              Service: 
+                - 'lambda.amazonaws.com'
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref LambdaManagedPolicy
+
+  LambdaCheckComplianceLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LambdaCheckComplianceSNSTopic}'
+      RetentionInDays: !Ref LogsRetentionInDays      
+
+  ConfigPermissionToCallLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt LambdaCheckComplianceSNSTopic.Arn 
+      Action: "lambda:InvokeFunction"
+      Principal: "config.amazonaws.com"
+
+  CloudWatchConfigRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: 
+      - ConfigPermissionToCallLambda
+    Properties:
+      Description: 'Rule to evalaute if the Alarms has an action to Default Local SNS Topic'
+      ConfigRuleName: CloudWatch-Alarm-Local-Topic-Check
+      InputParameters:
+        AlarmNameException: !Ref AlarmNameException   
+        DefaultNotificationTopic: !Ref DefaultNotificationTopic
+      Scope:
+        ComplianceResourceTypes:
+          - "AWS::CloudWatch::Alarm"
+      Source:
+        Owner: "CUSTOM_LAMBDA"
+        SourceDetails:
+          - EventSource: "aws.config"
+            MessageType: "ConfigurationItemChangeNotification"
+        SourceIdentifier: !GetAtt LambdaCheckComplianceSNSTopic.Arn
+
+  RemediationForConfigRule:
+    Type: 'AWS::Config::RemediationConfiguration'
+    Properties:
+      Automatic: true
+      ConfigRuleName: !Ref CloudWatchConfigRule
+      MaximumAutomaticAttempts: 5
+      RetryAttemptSeconds: 60
+      TargetId: !Ref SSMCreateSNSAction
+      TargetType: SSM_DOCUMENT
+      TargetVersion: '1'
+      Parameters:
+        AutomationAssumeRole:
+          StaticValue:
+            Values:
+              - !GetAtt AutoRemediationIamRole.Arn 
+        ResourceId:
+          ResourceValue:
+            Value: RESOURCE_ID
+        SNSTopicARN:
+          StaticValue:
+            Values:
+              - !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${SNSLocalTopic}"
+
+  AutoRemediationIamRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ssm.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonSSMAutomationRole'
+        - !Ref AutomationPolicy
+   
+  AutomationPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties: 
+      Description: 'Customer Managed Policy for Automation'
+      Path: / 
+      PolicyDocument: 
+        Version: 2012-10-17
+        Statement:
+          - Sid: AllowAutomationforCloudWatch
+            Effect: Allow
+            Action: 
+              - cloudwatch:DeleteAlarms
+              - cloudwatch:DescribeAlarmHistory
+              - cloudwatch:EnableAlarmActions
+              - cloudwatch:GetMetricData
+              - cloudwatch:ListMetrics
+              - cloudwatch:PutMetricAlarm
+              - cloudwatch:PutMetricData
+              - cloudwatch:DeleteAlarms
+              - cloudwatch:DescribeAlarms
+              - cloudwatch:DescribeAlarmsForMetric
+            Resource:
+              - !Sub "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:*"
+          - Sid: AllowAutomationforConfig
+            Effect: Allow
+            Action:
+              - config:PutConfigRule
+              - config:PutEvaluations
+              - config:StartConfigRulesEvaluation
+            Resource:
+              - !Sub "arn:aws:config:${AWS::Region}:${AWS::AccountId}:config-rule/*"
+          - Sid: AllowAutomationforCreateServiceLinkedRole
+            Effect: Allow
+            Action: 
+              - iam:PassRole
+              - iam:CreateServiceLinkedRole
+            Resource:
+              - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ssm.amazonaws.com/*"  
+
+
+  SSMCreateSNSAction:
+    Type: 'AWS::SSM::Document'
+    Properties: 
+      DocumentType: Automation
+      Content:
+        schemaVersion: "0.3"
+        assumeRole: "{{ AutomationAssumeRole }}"
+        description: Create Notification 
+        mainSteps:
+          - name: DescribeCloudWatchAlarm 
+            action: aws:executeAwsApi
+            inputs:
+              Service: cloudwatch
+              Api: DescribeAlarms
+              AlarmNames: 
+                - "{{ ResourceId }}"    
+            outputs:
+              - Name: EvaluationPeriods
+                Selector: $.MetricAlarms[0].EvaluationPeriods
+                Type: Integer 
+              - Name: ComparisonOperator
+                Selector: $.MetricAlarms[0].ComparisonOperator
+                Type: String
+              - Name: MetricName
+                Type: String 
+                Selector: $.MetricAlarms[0].MetricName                 
+              - Name: Period
+                Type: Integer 
+                Selector: $.MetricAlarms[0].Period     
+              - Name: Namespace
+                Type: String 
+                Selector: $.MetricAlarms[0].Namespace                                                 
+              - Name: Statistic
+                Type: String 
+                Selector: $.MetricAlarms[0].Statistic                                                 
+              - Name: Threshold
+                Type: Integer 
+                Selector: $.MetricAlarms[0].Threshold                                                                 
+          - name: CreateAlarActionForSNS
+            action: aws:executeAwsApi
+            inputs:
+              Service: cloudwatch
+              Api: PutMetricAlarm
+              AlarmActions: 
+                - "{{ SNSTopicARN }}"
+              AlarmName: "{{ ResourceId }}"
+              EvaluationPeriods: "{{ DescribeCloudWatchAlarm.EvaluationPeriods }}"
+              ComparisonOperator: "{{ DescribeCloudWatchAlarm.ComparisonOperator }}"
+              MetricName: "{{ DescribeCloudWatchAlarm.MetricName }}"
+              Period: "{{ DescribeCloudWatchAlarm.Period }}"
+              Namespace: "{{ DescribeCloudWatchAlarm.Namespace }}"
+              Statistic: "{{ DescribeCloudWatchAlarm.Statistic }}"
+              Threshold: "{{ DescribeCloudWatchAlarm.Threshold }}"
+        parameters:
+          AutomationAssumeRole:
+            type: String
+            description: Automation Assume Role Arn
+          ResourceId:
+            type: String
+            description: Resource ID
+          SNSTopicARN:  
+            type: String 
+            description: Local SNS Topic ARN 
+
+  LambdaCheckComplianceCloudWatch:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Description:  "Lambda function to evaluate monitoring compliance for Alarms"
+      Code:
+        ZipFile: |
+          import json, boto3
+          client_cw = boto3.client('cloudwatch')
+          client_config = boto3.client('config')
+          def cw_describe(resourceId_cw, rule_parameters):
+              metrics_missing = []
+              temp_dict = {}
+              for key in rule_parameters:
+                  temp_dict = json.loads(rule_parameters[key])
+                  metric = temp_dict['MetricName']
+                  alarm_name = f'{resourceId_cw}-{metric}'
+                  namespace = temp_dict['MetricNamespace']
+                  dimension = temp_dict['MetricDimensions']
+                  try:
+                      response = client_cw.describe_alarms_for_metric(
+                          MetricName=metric,
+                          Namespace=namespace,
+                          Dimensions=[
+                              {
+                                  'Name': dimension,
+                                  'Value': resourceId_cw
+                              }
+                          ]
+                      )
+                      metric_alarms = response['MetricAlarms']
+                      if len(metric_alarms) == 0:
+                        metrics_missing.append(metric)
+                      else:
+                        for y in metric_alarms:
+                          if y['AlarmName'] == alarm_name:
+                            append = 'no'
+                        if append != 'no':
+                          metrics_missing.append(metric)
+                  except Exception as e:
+                    print(e)
+              return metrics_missing
+          def evaluate_compliance(resourceId_cw, rule_parameters, configuration_item):
+              if configuration_item['configurationItemStatus'] == "ResourceDeleted":
+                  return {
+                      "compliance_type": "NOT_APPLICABLE",
+                      "annotation": "The configurationItem was deleted"
+                  }
+              for i in rule_parameters['Whitelistedresources']:
+                if i == configuration_item["resourceId"]: 
+                  return {
+                      "compliance_type": "COMPLIANT",
+                      "annotation": "Whitelisted"
+                  }                
+              del rule_parameters['Whitelistedresources']
+              param = {}
+              for key in rule_parameters:
+                param[key] = rule_parameters[key]
+                temp_dict_del = json.loads(rule_parameters[key])
+                if temp_dict_del['MetricName'] == 'null':
+                  del param[key]             
+              violation = cw_describe(resourceId_cw, param)
+              if len(violation) != 0:
+                  annotation = f'{resourceId_cw} missing metrics {violation}'
+                  return {
+                      "compliance_type": "NON_COMPLIANT",
+                      "annotation": json.dumps(annotation)
+                  }
+              else:
+                  return {
+                      "compliance_type": "COMPLIANT",
+                      "annotation": "compliant"
+                  }
+          def lambda_handler(event, context):
+              invoking_event = json.loads(event["invokingEvent"])
+              configuration_item = invoking_event["configurationItem"]
+              rule_parameters = json.loads(event["ruleParameters"])
+              result_token = event["resultToken"]
+              message = json.loads(event['invokingEvent'])
+              if message['configurationItem']['resourceType'] == 'AWS::RDS::DBInstance' or message['configurationItem']['resourceType'] == 'AWS::SNS::Topic':
+                resourceId_cw = message['configurationItem']['resourceName']
+              elif message['configurationItem']['resourceType']== 'AWS::ElasticLoadBalancingV2::LoadBalancer':
+                alb_resource_name = message['configurationItem']['resourceId']
+                resourceId_cw = alb_resource_name.split('/')[1]+'/'+alb_resource_name.split('/')[2]+'/'+alb_resource_name.split('/')[3]
+              else:
+                resourceId_cw = message['configurationItem']['resourceId']
+              evaluation = evaluate_compliance(resourceId_cw, rule_parameters, configuration_item)
+              try:
+                  client_config.put_evaluations(
+                  Evaluations=[
+                      {
+                          "ComplianceResourceType":
+                              configuration_item["resourceType"],
+                          "ComplianceResourceId":
+                              configuration_item["resourceId"],
+                          "ComplianceType":
+                              evaluation["compliance_type"],
+                          "Annotation":
+                              evaluation["annotation"],
+                          "OrderingTimestamp":
+                              configuration_item["configurationItemCaptureTime"]
+                      },
+                  ],
+                  ResultToken=result_token
+                  )
+              except Exception as e:
+                print(e)
+      Handler: 'index.lambda_handler'
+      MemorySize: 128
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: 'python3.7'
+      Timeout: 60
+
+
+  RoleforEventRuleCleanCloudWatch: 
+    Type: "AWS::IAM::Role"
+    Properties: 
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              Service: 
+                - events.amazonaws.com
+            Action: 
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref ManagedPolicyEventRoleClenCloudWatch
+
+  ManagedPolicyEventRoleClenCloudWatch:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: 'Customer Managed Policy for Even Rule to clean Cloudwatch Alarms'
+      Path: / 
+      PolicyDocument: 
+        Version: 2012-10-17
+        Statement:
+          - Sid: AllowAutomation 
+            Effect: Allow
+            Action: 
+              - ssm:StartAutomationExecution
+              - iam:PassRole
+            Resource:
+              - '*'
+
+  MonitorCleanCloudWatchAlarms:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Event Rule to monitor EC2 terminated instances in order to remove unnecessary alarms 
+      Targets:
+        - Arn: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${CleanAlarmsCloudWatch}:$DEFAULT"
+          Id: target-id1
+          RoleArn: !GetAtt RoleforEventRuleCleanCloudWatch.Arn
+          InputTransformer:
+            InputPathsMap:
+              InstanceIds: "$.detail.instance-id"
+            InputTemplate: " { \"ResourceId\" : [ <InstanceIds> ] }"
+      EventPattern:
+        {
+          "source": [
+            "aws.ec2"
+          ],
+          "detail-type": [
+            "EC2 Instance State-change Notification"
+          ],
+          "detail": {
+            "state": [
+              "terminated"
+            ]
+          }
+        }
+
+
+  CleanAlarmsCloudWatch:
+    Type: 'AWS::SSM::Document'
+    Properties:
+      DocumentType: Automation
+      Content:
+        schemaVersion: "0.3"
+        assumeRole: "{{ AutomationAssumeRole }}"
+        description: Create Document to purge CloudWatch Alarms
+        mainSteps:
+          - name: Start
+            action: aws:sleep
+            inputs:
+              Duration: PT3M            
+          - name: CleanCloudWatchDocument
+            action: 'aws:executeScript'
+            inputs:
+              Runtime: python3.6
+              Handler: script_handler
+              Script: |-
+                import json,boto3,string
+                client_cw = boto3.client('cloudwatch')
+                paginator = client_cw.get_paginator('describe_alarms')
+                alarms_arn = []
+                alarm_tobe_removed = []
+                response_list_tags = []
+                def script_handler(events, context):
+                  response_iterator =  paginator.paginate()
+                  for page in response_iterator:
+                    for i in page['MetricAlarms']:
+                      alarms_arn.append(i['AlarmArn'])
+                  for i in alarms_arn:
+                    response_list_tags = client_cw.list_tags_for_resource(ResourceARN=i)
+                    for tags in response_list_tags['Tags']:
+                      if tags.get('Key') == 'ResourceMonitored' and tags.get('Value') == events['ResourceId']:
+                        alarm_tobe_removed.append(i)
+                  if len(alarm_tobe_removed) > 0 :
+                    for alarm in alarm_tobe_removed:
+                        alarm_name = alarm.split(':')[6]
+                        client_cw.delete_alarms(AlarmNames=[alarm_name])
+              InputPayload:
+                ResourceId: '{{ ResourceId }}'
+        parameters:
+          AutomationAssumeRole:
+            type: String
+            default: !GetAtt AutoRemediationIamRole.Arn
+            description: Automation Assume Role Arn
+          ResourceId:
+            type: String
+            description: Resource ID
+
+  LambdaCheckComplianceCloudWatchParameterStore:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "/lambda/LambdaCheckComplianceCloudWatchARN"
+      Type: "String"
+      Value: !GetAtt  LambdaCheckComplianceCloudWatch.Arn
+      Description: "Lambda ARN for check Cloudwatch Compliance"
+
+  LambdaCheckComplianceLogGroupCloudWatch:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LambdaCheckComplianceCloudWatch}'
+      RetentionInDays: !Ref LogsRetentionInDays      
+
+  ConfigPermissionToCallLambdaCloudWatch:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt LambdaCheckComplianceCloudWatch.Arn 
+      Action: "lambda:InvokeFunction"
+      Principal: "config.amazonaws.com"

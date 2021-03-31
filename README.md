@@ -1,11 +1,7 @@
-## My Project
+## Compliance Management for Monitoring
 
-TODO: Fill this README out!
+The project has sample code that can be used  in order to automate compliance management for monitoring using AWS Cloudformation, AWS Lambda, AWS Config Rules and AWS SSM Automation Documents
 
-Be sure to:
-
-* Change the title in this README
-* Edit your repository description on GitHub
 
 ## Security
 
