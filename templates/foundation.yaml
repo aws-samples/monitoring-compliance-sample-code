@@ -27,6 +27,7 @@ Resources:
   LocalSNSTopic:
     Type: AWS::SNS::Topic
     Properties:
+      KmsMasterKeyId: alias/aws/sns
       DisplayName: !Ref SNSLocalTopic
       TopicName: !Ref SNSLocalTopic
 
